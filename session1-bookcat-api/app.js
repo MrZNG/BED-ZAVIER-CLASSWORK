@@ -17,7 +17,7 @@ const dbConfig = {
 };
 
 const AVAILABLE_STATUS = "D";
-const RENTED_STATUS = "L";
+const RENTED_STATUS = "M";
 
 const copySchema = Joi.object({
   isbn: Joi.string().length(10).required(),
