@@ -2,6 +2,7 @@ require("dotenv").config();
 
 const express = require("express");
 const sql = require("mssql");
+const Joi = require("joi");
 const app = express();
 
 app.use(express.json());
@@ -14,6 +15,41 @@ const dbConfig = {
   port: 1433,
   options: { trustServerCertificate: true },
 };
+
+const AVAILABLE_STATUS = "D";
+const RENTED_STATUS = "L";
+
+const copySchema = Joi.object({
+  isbn: Joi.string().length(10).required(),
+  copyNo: Joi.number().integer().min(1).required(),
+});
+
+const rateSchema = Joi.object({
+  rentalRate: Joi.number().min(2.5).required(),
+  status: Joi.string().length(1).required(),
+});
+
+async function checkAvailable(connection, isbn, copyNo) {
+  const result = await connection
+    .request()
+    .input("isbn", sql.Char(10), isbn)
+    .input("copyNo", sql.TinyInt, copyNo)
+    .query(
+      "SELECT Status FROM BookCopy WHERE ISBN = @isbn AND CopyNo = @copyNo",
+    );
+  return result.recordset[0];
+}
+
+async function markRented(connection, isbn, copyNo) {
+  await connection
+    .request()
+    .input("isbn", sql.Char(10), isbn)
+    .input("copyNo", sql.TinyInt, copyNo)
+    .input("status", sql.Char(1), RENTED_STATUS)
+    .query(
+      "UPDATE BookCopy SET Status = @status WHERE ISBN = @isbn AND CopyNo = @copyNo",
+    );
+}
 
 app.get("/", (req, res) => {
   res.send("Welcome to the Book Category API");
@@ -111,12 +147,21 @@ app.post("/publishers", async (req, res) => {
 });
 
 app.get("/books", async (req, res) => {
+  const title = req.query.title;
+
   let connection;
   try {
     connection = await sql.connect(dbConfig);
-    const result = await connection
-      .request()
-      .query("SELECT ISBN, Title, YearPublish, PublisherID, BookCat FROM Book");
+    const request = connection.request();
+    let query =
+      "SELECT ISBN, Title, YearPublish, PublisherID, BookCat FROM Book";
+
+    if (title) {
+      request.input("title", sql.VarChar(200), title);
+      query += " WHERE Title LIKE '%' + @title + '%'";
+    }
+
+    const result = await request.query(query);
     res.json(result.recordset);
   } catch (err) {
     res.status(500).json({ error: "Database error" });
@@ -297,21 +342,26 @@ app.get("/books/:isbn/copies/:copyNo", async (req, res) => {
 });
 
 app.put("/books/:isbn/copies/:copyNo", async (req, res) => {
-  const { rentalRate, status } = req.body;
-
-  if (rentalRate === undefined || !status) {
-    return res
-      .status(400)
-      .json({ error: "rentalRate and status are required" });
+  const paramCheck = copySchema.validate(req.params);
+  if (paramCheck.error) {
+    return res.status(400).json({ error: paramCheck.error.details[0].message });
   }
+
+  const bodyCheck = rateSchema.validate(req.body);
+  if (bodyCheck.error) {
+    return res.status(400).json({ error: bodyCheck.error.details[0].message });
+  }
+
+  const { isbn, copyNo } = paramCheck.value;
+  const { rentalRate, status } = bodyCheck.value;
 
   let connection;
   try {
     connection = await sql.connect(dbConfig);
     const result = await connection
       .request()
-      .input("isbn", sql.Char(10), req.params.isbn)
-      .input("copyNo", sql.TinyInt, req.params.copyNo)
+      .input("isbn", sql.Char(10), isbn)
+      .input("copyNo", sql.TinyInt, copyNo)
       .input("rentalRate", sql.SmallMoney, rentalRate)
       .input("status", sql.Char(1), status)
       .query(
@@ -322,19 +372,67 @@ app.put("/books/:isbn/copies/:copyNo", async (req, res) => {
     if (result.rowsAffected[0] === 0) {
       return res.status(404).json({ error: "Copy not found" });
     }
-    res.json({
-      isbn: req.params.isbn,
-      copyNo: req.params.copyNo,
-      rentalRate,
-      status,
-    });
+    res.json({ isbn, copyNo, rentalRate, status });
   } catch (err) {
-    if (err.number === 547) {
-      return res
-        .status(400)
-        .json({ error: "Rental rate must be at least 2.50" });
-    }
     res.status(500).json({ error: "Database error" });
+  } finally {
+    if (connection) await connection.close();
+  }
+});
+
+app.put("/books/:isbn/copies/:copyNo/rent", async (req, res) => {
+  const check = copySchema.validate(req.params);
+  if (check.error) {
+    return res.status(400).json({ error: check.error.details[0].message });
+  }
+
+  const { isbn, copyNo } = check.value;
+
+  let connection;
+  try {
+    connection = await sql.connect(dbConfig);
+
+    const copy = await checkAvailable(connection, isbn, copyNo);
+    if (!copy) {
+      return res.status(404).json({ error: "Copy not found" });
+    }
+    if (copy.Status !== AVAILABLE_STATUS) {
+      return res.status(409).json({ error: "Already rented" });
+    }
+
+    await markRented(connection, isbn, copyNo);
+    res.json({ message: "Copy rented", isbn, copyNo, status: RENTED_STATUS });
+  } catch (err) {
+    res.status(500).json({ error: "Database error" });
+  } finally {
+    if (connection) await connection.close();
+  }
+});
+
+app.delete("/books/:isbn/copies/:copyNo", async (req, res) => {
+  const check = copySchema.validate(req.params);
+  if (check.error) {
+    return res.status(400).json({ error: check.error.details[0].message });
+  }
+
+  const { isbn, copyNo } = check.value;
+
+  let connection;
+  try {
+    connection = await sql.connect(dbConfig);
+    const result = await connection
+      .request()
+      .input("isbn", sql.Char(10), isbn)
+      .input("copyNo", sql.TinyInt, copyNo)
+      .query("DELETE FROM BookCopy WHERE ISBN = @isbn AND CopyNo = @copyNo");
+
+    if (result.rowsAffected[0] === 0) {
+      return res.status(404).json({ error: "Copy not found" });
+    }
+    res.json({ message: "Copy deleted", isbn, copyNo });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Could not delete the copy" });
   } finally {
     if (connection) await connection.close();
   }
